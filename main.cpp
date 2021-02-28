@@ -4,7 +4,10 @@
 #include <map>
 #include <math.h>
 #include "qdbmp.h"
-
+#include <vector>
+#include <iostream>
+#include <time.h>
+#include <string>
 
 const int SOI_MARKER = 0xD8;
 const int APP0_MARKER = 0xE0;
@@ -14,6 +17,7 @@ const int DHT_MARKER = 0xC4;
 const int SOS_MARKER = 0xDA;
 const int EOI_MARKER = 0xD9;
 const int COM_MARKER = 0xFE;
+const int DRI_MARKER = 0xDD;
 
 struct {
     int height;
@@ -30,8 +34,8 @@ struct {
 unsigned char maxWidth, maxHeight;
 
 struct acCode {
-    unsigned char len;
-    unsigned char zeros;
+    unsigned char len;    /*code length*/
+    unsigned char zeros;  /*zero run*/
     int value;
 };
 
@@ -46,8 +50,14 @@ int quantTable[4][128];
 const int DC = 0;
 const int AC = 1;
 std::map<std::pair<unsigned char, unsigned int>, unsigned char> huffTable[2][2];
+std::map<unsigned int, std::string> byteStream;
+int stream_num = 1;
 
 double cos_cache[200];
+void outputVector(std::vector<unsigned char>);
+// 静态局部变量，存储于进程的全局数据区，即使函数返回，它的值也会保持不变。后面的dc值会存起来
+int dc[4] = {0, 0, 0, 0};  
+
 
 void init_cos_cache() {
     for (int i = 0; i < 200; i++) {
@@ -56,7 +66,7 @@ void init_cos_cache() {
 }
 
 class MCU {
-public:
+    public:
     BLOCK mcu[4][2][2];
     // 除錯用
     void show() {
@@ -69,7 +79,6 @@ public:
                         for (int j = 0; j < 8; j++) {
                             printf("%lf ", mcu[id][h][w][i][j]);
                         }
-                        printf("\n");
                     }
                 }
             }
@@ -132,7 +141,7 @@ public:
 //                             tmp[i][j] /= 4.0;
 //                         }
 //                     }
-					// 計算兩次一維idct去計算二維idct
+                    // 計算兩次一維idct去計算二維idct
                     double s[8][8] = {};
                     for (int j = 0; j < 8; j++) {
                         for (int x = 0; x < 8; x++) {
@@ -215,7 +224,6 @@ private:
     }
 };
 
-
 // 讀取 Section 用之輔助函式
 
 void showSectionName(const char *s) {
@@ -267,7 +275,6 @@ void readAPP(FILE *f) {
     printf("y方向像素密度：%d\n", v[0] * 16 + v[1]);
     fseek(f, len - 14, SEEK_CUR);
 }
-
 void readDQT(FILE *f) {
     unsigned int len = EnterNewSection(f, "DQT");
     len -= 2;
@@ -300,6 +307,7 @@ void readDQT(FILE *f) {
         len -= (precision*64);
     }
 }
+
 void readSOF(FILE *f) {
     unsigned int len = EnterNewSection(f, "SOF");
     fseek(f, 1, SEEK_CUR); // 精度
@@ -364,7 +372,7 @@ void readDHT(FILE *f) {
             unsigned char v;
             fread(&v, 1, 1, f);
             huffTable[DCorAC][id][huffCode[i]] = v;
-            printf("%d %d: %d\n", huffCode[i].first, huffCode[i].second, v);
+            // printf("%d %d: %d\n", huffCode[i].first, huffCode[i].second, v);
         }
         free(huffCode);
 
@@ -386,121 +394,146 @@ void readSOS(FILE *f) {
     fseek(f, 3, SEEK_CUR);
 }
 
-// 必須連續呼叫getBit，中間被fread斷掉就會出問題
-bool getBit(FILE *f) {
-    static unsigned char buf;
-    static unsigned char count = 0;
-    if (count == 0) {
-        fread(&buf, 1, 1, f);
-        if (buf == 0xFF) {
-            unsigned char check;
-            fread(&check, 1, 1, f);
-            if (check != 0x00) {
-                fprintf(stderr, "data 段有不是 0xFF00 的數據");
-            }
-        }
-    }
-    bool ret = buf & (1 << (7 - count));
-    count = (count == 7 ? 0 : count + 1);
-    return ret;
+
+// 必須連續呼叫getBit，中間被fread斷掉就會出問題，每次读取一个bit
+bool getBit(unsigned int iter, int index) {
+    static int *bit_count = new int[stream_num]{};
+    // 虽然每次读取一个字节，但是利用了count的循环，控制了一个字节可以获取8个bit
+    int cur = bit_count[index] / 8;
+    int bit = bit_count[index] % 8;
+    bit_count[index] += 1;
+    return byteStream[iter][cur] & (1 << (7 - bit));
 }
 
-unsigned char matchHuff(FILE *f, unsigned char number, unsigned char ACorDC) {
+
+unsigned char matchHuff(unsigned char number, unsigned char ACorDC, unsigned int iter, int index) {
     unsigned int len = 0;
     unsigned char codeLen;
-    for (int count = 1; ; count++) {
+    for (int count = 1; ; count++) {  
         len = len << 1;
-        len += (unsigned int)getBit(f);
-        if (huffTable[ACorDC][number].find(std::make_pair(count, len)) != huffTable[ACorDC][number].end()) {
+        len += (unsigned int)getBit(iter, index);    //每次读取一个bit
+        // 迭代器找到了该元素，没找到会返回end迭代器
+        if (huffTable[ACorDC][number].find(std::make_pair(count, len)) != huffTable[ACorDC][number].end()) { 
             codeLen = huffTable[ACorDC][number][std::make_pair(count, len)];
             return codeLen;
         }
-        if (count > 16) {fprintf(stderr, "key not found\n"); count = 1; len = 0;}
+        // codeword 最大为16个元素，如果失败了，缺失key，重来。此时文件头已经读过去了，抛弃了16个bits
+        if (count > 16) {
+            printf("%d, %d, %d\n", count, len, ACorDC);
+            fprintf(stderr, "key not found\n"); 
+            count = 1; len = 0;
+        }
     }
 }
 
-int readDC(FILE *f, unsigned char number) {
-    unsigned char codeLen = matchHuff(f, number, DC);
-    if (codeLen == 0) { return 0; }
-    unsigned char first = getBit(f);
+int readDC(unsigned char number,unsigned int iter, int index) {
+    // if (id == 1) {printf("%d ", ftell(f));}
+    unsigned char codeLen = matchHuff(number, DC, iter, index);  //查表,得到codelen，即下一次取多少bit
+    if (codeLen == 0) { return 0; }  
+    unsigned char first = getBit(iter, index); //符号位
     int ret = 1;
     for (int i = 1; i < codeLen; i++) {
-        unsigned char b = getBit(f);
+        unsigned char b = getBit(iter, index);
         ret = ret << 1;
         ret += first ? b : !b;
     }
     ret = first ? ret : -ret;
-//    printf("read DC: len %d, value %d\n", codeLen, ret);
+    // printf("read DC: len %d, value %d\n", codeLen, ret);
     return ret;
 }
 
 // 計算ZRL
-acCode readAC(FILE *f, unsigned char number) {
-    unsigned char x = matchHuff(f, number, AC);
-    unsigned char zeros = x >> 4;
-    unsigned char codeLen = x & 0x0F;
-    if (x == 0) {
-        return acCode{0,0,0};
-    } else if (x == 0xF0) {
+acCode readAC(unsigned char number,unsigned int iter, int index) {
+    unsigned char x = matchHuff(number, AC, iter, index); //查表，返回1 byte
+    unsigned char zeros = x >> 4;               //前面的0
+    unsigned char codeLen = x & 0x0F;           //编码的长度
+    if (x == 0) {   //EOB
+        return acCode{0,0,0};  
+    } else if (x == 0xF0) {     // 连续16个0
         return acCode{0, 16, 0};
     }
-    unsigned  char first = getBit(f);
-    int code = 1;
+    unsigned char first = getBit(iter, index);
+    int value = 1;
+    /* value = 2^(codelen - 1) + signed offset = 4  右移（codelen-1） + 剩余部分
+       1100
+       1 - true
+       1 - 右移动加1 - 11
+       0 - 110
+       0 - 1100 = 14
+
+       0110 - 6
+       0 - false
+       1 - 10本字段
+     ②MCU块的单元中的重新开始间隔
+    */
     for (int i = 1; i < codeLen; i++) {
-        unsigned char b = getBit(f);
-        code = code << 1;
-        code += first ? b : !b;
+        unsigned char b = getBit(iter, index);
+        value = value << 1;       // 右移
+        value += first ? b : !b;  // 如果first为真，就取b，否则！b         
     }
-    code = first ? code : -code;
-//    printf("read AC: %d %d %d\n", codeLen, zeros, code);
-    return acCode{codeLen, zeros, code};
+    value = first ? value : -value;
+    //printf("read AC: %d %d %d\n", codeLen, zeros, value);
+    return acCode{codeLen, zeros, value};
 }
 
-MCU readMCU(FILE *f) {
-    static int dc[4] = {0, 0, 0, 0};
+MCU readMCU(unsigned int iter, int index) {
     auto mcu = MCU();
     for (int i = 1; i <= 3; i++) {
         for (int h = 0; h < subVector[i].height; h++) {
             for (int w = 0; w < subVector[i].width; w++) {
-                dc[i] = readDC(f, i/2) + dc[i];
+                int DCvalue = readDC(i/2, iter, index);
+                dc[i] = DCvalue + dc[i];
+                // if(i == 1) {
+                //     FILE *fp = fopen("o.txt", "a");
+                //     fprintf(fp,"%d\n",DCvalue);  //字符使用%c
+                //     fclose(fp);
+                // }
                 mcu.mcu[i][h][w][0][0] = dc[i];
                 unsigned int count = 1;
                 while (count < 64) {
-                    acCode ac = readAC(f, i/2);
+                    acCode ac = readAC(i/2, iter, index);
+                    /*zeros最多只可以有16个0*/
                     if (ac.len == 0 && ac.zeros == 16) {
                         for (int j = 0; j < ac.zeros; j++) {
                             mcu.mcu[i][h][w][count/8][count%8] = 0;
                             count++;
                         }
-                    } else if (ac.len == 0) {
+                    } else if (ac.len == 0 && ac.zeros == 0) {
+                        /*如果ac碰到了EOB，则给剩下的值赋予0*/
+                        while (count < 64) {
+                            mcu.mcu[i][h][w][count/8][count%8] = 0;
+                            count++;
+                        }
                         break;
                     } else {
+                        // 对前面的0元素赋0，以及当前元素赋予初值value
                         for (int j = 0; j < ac.zeros; j++) {
                             mcu.mcu[i][h][w][count/8][count%8] = 0;
                             count++;
                         }
-                        mcu.mcu[i][h][w][count/8][count%8] = ac.value;
+                        mcu.mcu[i][h][w][count/8][count%8] = ac.value;  //给mcu块赋值
                         count++;
                     }
                 }
-                while (count < 64) {
-                    mcu.mcu[i][h][w][count/8][count%8] = 0;
-                    count++;
-                }
+            
             }
         }
     }
     return mcu;
 }
 
-void readData(FILE *f) {
-    printf("************************* test read data **********************************\n");
+void readData() {
+    printf("************************* Read data **********************************\n");
     int w = (image.width - 1) / (8*maxWidth) + 1;
     int h = (image.height - 1) / (8*maxHeight) + 1;
+    int index = 0;
+    int inter = w * h / stream_num;
+    printf("%d\n", inter);
     BMP *bmp = BMP_Create(maxWidth * 8 * w, maxHeight * 8 * h, 24);
+    std::map<unsigned int, std::string>::iterator iter = byteStream.begin();
     for (int i = 0; i < h; i++) {
         for (int j = 0; j < w; j++) {
-            MCU mcu = readMCU(f);
+            MCU mcu = readMCU(iter->first, index);
             mcu.decode();
             RGB **b = mcu.toRGB();
             for (int y = i*8*maxHeight; y < (i+1)*8*maxHeight; y++) {
@@ -510,15 +543,111 @@ void readData(FILE *f) {
                     BMP_SetPixelRGB(bmp, x, y, b[by][bx].R, b[by][bx].G, b[by][bx].B);
                 }
             }
+            // outputVector(iter->second);
+            int mcu_count = i*w + j+ 1;
+            if(mcu_count % inter == 0) {
+                iter ++; 
+                index++; dc[0] = 0; dc[1] = 0; dc[2]= 0;  dc[3]= 0; 
+                std::cout << index << " "<< stream_num<< std::endl;
+            }
         }
     }
     BMP_WriteFile(bmp, "out.bmp");
 }
 
+
+unsigned int readDRI(FILE *f) {
+    unsigned int len = EnterNewSection(f, "DRI");
+    unsigned char c[2];
+    fread(&c, 1, 2, f);
+    unsigned int interv  = c[0] << 8 + c[1];
+    printf("复位的间隔是 %d\n", interv);
+    return interv;
+}
+
+
+void matchRst(FILE *f){
+    printf("scan for the image data\n");
+    bool flag = true; 
+    std::string stream;
+    int start_pos_key = ftell(f);
+    unsigned char cur;
+    while (flag) {
+        fread(&cur, 1, 1, f);
+        if (cur != 0xFF) {
+            stream.push_back(cur);
+            continue;
+        }
+        
+        // 到这里时 curr == 0xFF
+        // 下一个字节为 next == 0x00, 0xFF, 0xab
+        unsigned char next;
+        fread(&next, 1, 1, f);
+        while(next== 0xFF) { // 当check不为FF跳出
+            fread(&next, 1, 1, f);
+        }   
+
+        if(next == 0x00) {
+            stream.push_back(0xFF);
+            continue;
+        }
+        
+        byteStream[start_pos_key] = stream;
+        stream.clear(); // 清除所有的元素
+        // 能到这里说明是碰到了标记位 0xFFab 
+        switch (next)  
+        {
+        case 0xD0:
+        case 0xD1:
+        case 0xD2:
+        case 0xD3:
+        case 0xD4:
+        case 0xD5:
+        case 0xD6:
+        case 0xD7: // 如果碰到rst标记
+            flag = true;
+            start_pos_key = ftell(f); //更新key
+            break;
+        default: //其他标记，直接跳出
+            if(next != 0xD9){
+                fprintf(stderr, "data段有不是0xFF00的数据 %02x\n", next);
+            }
+            fseek(f, -2, SEEK_CUR);
+            flag = false;
+        }
+    } 
+    //readData(f);
+    stream_num = byteStream.size();
+}
+void outputVector(std::string v) {
+    for(int i = 0; i < v.size(); i++) {
+        std::cout << std::hex << v[i] << " ";
+    }
+    printf("\n");
+}
+
+
+void outputMap() {
+    std::map<unsigned int, std::string>::iterator iter;
+    int i = 0;
+	for (iter = byteStream.begin(); iter != byteStream.end(); iter++, i++) {
+		std::cout << iter->first << "->" << std::endl;
+        if (i == 255) {
+            outputVector(iter->second); 
+        }
+
+	}
+}
+
 void readStream(FILE *f) {
+    int lock = 1;
+    int interv = 0;
     unsigned char c;
-    fread(&c, 1, 1, f);
-    while (c == 0xFF) {
+    while (lock) {
+        fread(&c, 1, 1, f);
+        if(c != 0xFF) {
+            continue;
+        }
         fread(&c, 1, 1, f);
         switch (c) {
             case SOI_MARKER:
@@ -556,12 +685,21 @@ void readStream(FILE *f) {
                 break;
             case SOS_MARKER:
                 readSOS(f);
-                readData(f);
+                matchRst(f);
+                //outputMap();
+                readData();
+                break;
+            case DRI_MARKER:
+                interv = readDRI(f);
+                printf("%d --- \n", interv);
                 break;
             case EOI_MARKER:
+                lock = 0;
+                printf("End of Image\n");
                 break;
+            default:
+                printf("other marker: %02x\n", c);
         }
-        fread(&c, 1, 1, f);
     }
     if (fread(&c, 1, 1, f) != 0) {
         fprintf(stderr, "沒有吃完就結束\n");
@@ -569,6 +707,8 @@ void readStream(FILE *f) {
 }
 
 int main(int argc, char *argv[]) {
+    clock_t start,end;     //定义clock_t变量
+    start = clock();       //开始时间
     if (argc != 2) {
         fprintf(stderr, "用法：jpeg_decoder <jpeg file>\n");
         return 1;
@@ -579,5 +719,18 @@ int main(int argc, char *argv[]) {
     }
     init_cos_cache();
     readStream(f);
+    end = clock();
+    printf("Time is %fs\n", double(end-start)/CLOCKS_PER_SEC);
     return 0;
 }
+
+// int main(int argc, char *argv[]) {
+//     FILE *f = fopen("leaves.jpg", "r");
+//     if (f == NULL) {
+//         fprintf(stderr, "檔案開啟失敗\n");
+//     }
+//     init_cos_cache();
+//     readStream(f);
+//     return 0;
+// }
+
