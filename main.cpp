@@ -8,6 +8,7 @@
 #include <iostream>
 #include <time.h>
 #include <string>
+using namespace std;
 
 const int SOI_MARKER = 0xD8;
 const int APP0_MARKER = 0xE0;
@@ -49,12 +50,10 @@ int quantTable[4][128];
 
 const int DC = 0;
 const int AC = 1;
-std::map<std::pair<unsigned char, unsigned int>, unsigned char> huffTable[2][2];
-std::map<unsigned int, std::string> byteStream;
-int stream_num = 1;
-
+map<pair<unsigned char, unsigned int>, unsigned char> huffTable[2][2];
+map<int, pair<int, string>> byteStream;
 double cos_cache[200];
-void outputVector(std::vector<unsigned char>);
+int stream_num = 1;
 // 静态局部变量，存储于进程的全局数据区，即使函数返回，它的值也会保持不变。后面的dc值会存起来
 int dc[4] = {0, 0, 0, 0};  
 
@@ -334,14 +333,14 @@ void readSOF(FILE *f) {
     }
 }
 
-std::pair<unsigned char, unsigned int>* createHuffCode(unsigned char *a, unsigned int number) {
-    int si = sizeof(std::pair<unsigned char, unsigned int>);
-    auto ret = (std::pair<unsigned char, unsigned int>*)malloc(si * number);
+pair<unsigned char, unsigned int>* createHuffCode(unsigned char *a, unsigned int number) {
+    int si = sizeof(pair<unsigned char, unsigned int>);
+    auto ret = (pair<unsigned char, unsigned int>*)malloc(si * number);
     int code = 0;
     int count = 0;
     for (int i = 0; i < 16; i++) {
         for (int j = 0; j < a[i]; j++) {
-            ret[count++] = std::make_pair(i + 1, code);
+            ret[count++] = make_pair(i + 1, code);
             code += 1;
         }
         code = code << 1;
@@ -372,7 +371,7 @@ void readDHT(FILE *f) {
             unsigned char v;
             fread(&v, 1, 1, f);
             huffTable[DCorAC][id][huffCode[i]] = v;
-            // printf("%d %d: %d\n", huffCode[i].first, huffCode[i].second, v);
+            printf("%d %d: %d\n", huffCode[i].first, huffCode[i].second, v);
         }
         free(huffCode);
 
@@ -381,7 +380,6 @@ void readDHT(FILE *f) {
 }
 void readSOS(FILE *f) {
     unsigned int len = EnterNewSection(f, "SOS");
-
     fseek(f, 1, SEEK_CUR);   // 顏色分量數，固定為3
     for (int i = 0; i < 3; i++) {
         unsigned char v[1];
@@ -396,44 +394,62 @@ void readSOS(FILE *f) {
 
 
 // 必須連續呼叫getBit，中間被fread斷掉就會出問題，每次读取一个bit
-bool getBit(unsigned int iter, int index) {
-    static int *bit_count = new int[stream_num]{};
+bool getBit(int key) {
     // 虽然每次读取一个字节，但是利用了count的循环，控制了一个字节可以获取8个bit
-    int cur = bit_count[index] / 8;
-    int bit = bit_count[index] % 8;
-    bit_count[index] += 1;
-    return byteStream[iter][cur] & (1 << (7 - bit));
+    int cur_byte = byteStream[key].first / 8;
+    int cur_bit = byteStream[key].first % 8;
+    string bit_string = byteStream[key].second;
+    byteStream[key].first += 1;
+    return byteStream[key].second[cur_byte] & (1 << (7 - cur_bit));
+}
+
+void removeBit(int key, int num){
+    for(int i=0;i<num; i++){
+        getBit(key);
+    }
 }
 
 
-unsigned char matchHuff(unsigned char number, unsigned char ACorDC, unsigned int iter, int index) {
+
+unsigned char matchHuff(unsigned char number, unsigned char ACorDC, int key) {
     unsigned int len = 0;
     unsigned char codeLen;
     for (int count = 1; ; count++) {  
         len = len << 1;
-        len += (unsigned int)getBit(iter, index);    //每次读取一个bit
+        len += (unsigned int)getBit(key);    //每次读取一个bit
         // 迭代器找到了该元素，没找到会返回end迭代器
         if (huffTable[ACorDC][number].find(std::make_pair(count, len)) != huffTable[ACorDC][number].end()) { 
             codeLen = huffTable[ACorDC][number][std::make_pair(count, len)];
             return codeLen;
         }
-        // codeword 最大为16个元素，如果失败了，缺失key，重来。此时文件头已经读过去了，抛弃了16个bits
-        if (count > 16) {
-            printf("%d, %d, %d\n", count, len, ACorDC);
-            fprintf(stderr, "key not found\n"); 
-            count = 1; len = 0;
+
+        if (ACorDC == DC) {
+            // DC codeword 最大为11个元素，如果失败了，抛弃11bit
+            if (count > 11) {
+                printf("%d, %d, %d\n", count, len, ACorDC);
+                fprintf(stderr, "DC key not found\n"); 
+                count = 1; len = 0;
+
+            }
+        } else {
+            // AC codeword 最大为16个元素，如果失败了，缺失key，重来。此时文件头已经读过去了，抛弃了16个bits
+            if (count > 16) {
+                printf("%d, %d, %d\n", count, len, ACorDC);
+                fprintf(stderr, "AC key not found\n"); 
+                count = 1; len = 0;
+            }
         }
     }
 }
 
-int readDC(unsigned char number,unsigned int iter, int index) {
+int readDC(unsigned char number, int key) {
     // if (id == 1) {printf("%d ", ftell(f));}
-    unsigned char codeLen = matchHuff(number, DC, iter, index);  //查表,得到codelen，即下一次取多少bit
+    unsigned char codeLen = matchHuff(number, DC, key);  //查表,得到codelen，即下一次取多少bit
     if (codeLen == 0) { return 0; }  
-    unsigned char first = getBit(iter, index); //符号位
+    unsigned char first = getBit(key); //符号位
     int ret = 1;
     for (int i = 1; i < codeLen; i++) {
-        unsigned char b = getBit(iter, index);
+        unsigned char b = getBit(key);
         ret = ret << 1;
         ret += first ? b : !b;
     }
@@ -443,8 +459,8 @@ int readDC(unsigned char number,unsigned int iter, int index) {
 }
 
 // 計算ZRL
-acCode readAC(unsigned char number,unsigned int iter, int index) {
-    unsigned char x = matchHuff(number, AC, iter, index); //查表，返回1 byte
+acCode readAC(unsigned char number, int key) {
+    unsigned char x = matchHuff(number, AC, key); //查表，返回1 byte
     unsigned char zeros = x >> 4;               //前面的0
     unsigned char codeLen = x & 0x0F;           //编码的长度
     if (x == 0) {   //EOB
@@ -452,7 +468,7 @@ acCode readAC(unsigned char number,unsigned int iter, int index) {
     } else if (x == 0xF0) {     // 连续16个0
         return acCode{0, 16, 0};
     }
-    unsigned char first = getBit(iter, index);
+    unsigned char first = getBit(key);
     int value = 1;
     /* value = 2^(codelen - 1) + signed offset = 4  右移（codelen-1） + 剩余部分
        1100
@@ -460,14 +476,9 @@ acCode readAC(unsigned char number,unsigned int iter, int index) {
        1 - 右移动加1 - 11
        0 - 110
        0 - 1100 = 14
-
-       0110 - 6
-       0 - false
-       1 - 10本字段
-     ②MCU块的单元中的重新开始间隔
     */
     for (int i = 1; i < codeLen; i++) {
-        unsigned char b = getBit(iter, index);
+        unsigned char b = getBit(key);
         value = value << 1;       // 右移
         value += first ? b : !b;  // 如果first为真，就取b，否则！b         
     }
@@ -476,12 +487,12 @@ acCode readAC(unsigned char number,unsigned int iter, int index) {
     return acCode{codeLen, zeros, value};
 }
 
-MCU readMCU(unsigned int iter, int index) {
+MCU readMCU(int key) {
     auto mcu = MCU();
     for (int i = 1; i <= 3; i++) {
         for (int h = 0; h < subVector[i].height; h++) {
             for (int w = 0; w < subVector[i].width; w++) {
-                int DCvalue = readDC(i/2, iter, index);
+                int DCvalue = readDC(i/2, key);
                 dc[i] = DCvalue + dc[i];
                 // if(i == 1) {
                 //     FILE *fp = fopen("o.txt", "a");
@@ -491,7 +502,7 @@ MCU readMCU(unsigned int iter, int index) {
                 mcu.mcu[i][h][w][0][0] = dc[i];
                 unsigned int count = 1;
                 while (count < 64) {
-                    acCode ac = readAC(i/2, iter, index);
+                    acCode ac = readAC(i/2, key);
                     /*zeros最多只可以有16个0*/
                     if (ac.len == 0 && ac.zeros == 16) {
                         for (int j = 0; j < ac.zeros; j++) {
@@ -526,14 +537,13 @@ void readData() {
     printf("************************* Read data **********************************\n");
     int w = (image.width - 1) / (8*maxWidth) + 1;
     int h = (image.height - 1) / (8*maxHeight) + 1;
+    int inter_mcu = w * h / stream_num; 
     int index = 0;
-    int inter = w * h / stream_num;
-    printf("%d\n", inter);
     BMP *bmp = BMP_Create(maxWidth * 8 * w, maxHeight * 8 * h, 24);
-    std::map<unsigned int, std::string>::iterator iter = byteStream.begin();
+    map<int, pair<int, string>>::iterator iter = byteStream.begin();
     for (int i = 0; i < h; i++) {
         for (int j = 0; j < w; j++) {
-            MCU mcu = readMCU(iter->first, index);
+            MCU mcu = readMCU(iter->first);
             mcu.decode();
             RGB **b = mcu.toRGB();
             for (int y = i*8*maxHeight; y < (i+1)*8*maxHeight; y++) {
@@ -543,12 +553,11 @@ void readData() {
                     BMP_SetPixelRGB(bmp, x, y, b[by][bx].R, b[by][bx].G, b[by][bx].B);
                 }
             }
-            // outputVector(iter->second);
             int mcu_count = i*w + j+ 1;
-            if(mcu_count % inter == 0) {
-                iter ++; 
-                index++; dc[0] = 0; dc[1] = 0; dc[2]= 0;  dc[3]= 0; 
-                std::cout << index << " "<< stream_num<< std::endl;
+            if(mcu_count % inter_mcu == 0) {
+                iter ++; index ++;
+                dc[0] = 0; dc[1] = 0; dc[2]= 0;  dc[3]= 0; 
+                cout << index << " " << stream_num << endl;
             }
         }
     }
@@ -569,7 +578,7 @@ unsigned int readDRI(FILE *f) {
 void matchRst(FILE *f){
     printf("scan for the image data\n");
     bool flag = true; 
-    std::string stream;
+    string stream;
     int start_pos_key = ftell(f);
     unsigned char cur;
     while (flag) {
@@ -578,7 +587,6 @@ void matchRst(FILE *f){
             stream.push_back(cur);
             continue;
         }
-        
         // 到这里时 curr == 0xFF
         // 下一个字节为 next == 0x00, 0xFF, 0xab
         unsigned char next;
@@ -591,8 +599,9 @@ void matchRst(FILE *f){
             stream.push_back(0xFF);
             continue;
         }
-        
-        byteStream[start_pos_key] = stream;
+        // 把想要的元素放到map里
+        std::pair<int, string> val = std::make_pair(0, stream);
+        byteStream[start_pos_key] = val;
         stream.clear(); // 清除所有的元素
         // 能到这里说明是碰到了标记位 0xFFab 
         switch (next)  
@@ -619,23 +628,16 @@ void matchRst(FILE *f){
     //readData(f);
     stream_num = byteStream.size();
 }
-void outputVector(std::string v) {
-    for(int i = 0; i < v.size(); i++) {
-        std::cout << std::hex << v[i] << " ";
-    }
-    printf("\n");
-}
+
 
 
 void outputMap() {
-    std::map<unsigned int, std::string>::iterator iter;
+    map<int, pair<int, string>>::iterator iter;
     int i = 0;
 	for (iter = byteStream.begin(); iter != byteStream.end(); iter++, i++) {
-		std::cout << iter->first << "->" << std::endl;
-        if (i == 255) {
-            outputVector(iter->second); 
-        }
-
+        cout << "Start:" <<iter->first << endl;
+        cout << "Cur bit position:" << iter->second.first << endl;
+        cout << iter->second.second << endl;
 	}
 }
 
@@ -723,14 +725,3 @@ int main(int argc, char *argv[]) {
     printf("Time is %fs\n", double(end-start)/CLOCKS_PER_SEC);
     return 0;
 }
-
-// int main(int argc, char *argv[]) {
-//     FILE *f = fopen("leaves.jpg", "r");
-//     if (f == NULL) {
-//         fprintf(stderr, "檔案開啟失敗\n");
-//     }
-//     init_cos_cache();
-//     readStream(f);
-//     return 0;
-// }
-
