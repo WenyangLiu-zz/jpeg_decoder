@@ -8,6 +8,8 @@
 #include <iostream>
 #include <time.h>
 #include <string>
+#include <bitset>
+
 using namespace std;
 
 const int SOI_MARKER = 0xD8;
@@ -54,7 +56,6 @@ map<pair<unsigned char, unsigned int>, unsigned char> huffTable[2][2];
 map<int, pair<int, string>> byteStream;
 double cos_cache[200];
 int stream_num = 1;
-// 静态局部变量，存储于进程的全局数据区，即使函数返回，它的值也会保持不变。后面的dc值会存起来
 int dc[4] = {0, 0, 0, 0};  
 
 
@@ -333,30 +334,36 @@ void readSOF(FILE *f) {
     }
 }
 
+//创建范式huffcode，与标准的huffmancode不一样的点在与，加了3点约束
+//1. 最小编码长度的第一个编码必须从 0 开始。
+//2. 相同长度编码必须是连续的。
+//3. 编码长度为j的第一个符号可以从编码长度为j-1的最后一个符号所得知，即c_j = 2(c_{j-1}+1) -> c_j = (c_{j-1}+1) << 1 加一左移
+
 pair<unsigned char, unsigned int>* createHuffCode(unsigned char *a, unsigned int number) {
     int si = sizeof(pair<unsigned char, unsigned int>);
-    auto ret = (pair<unsigned char, unsigned int>*)malloc(si * number);
+    auto ret = (pair<unsigned char, unsigned int>*)malloc(si*number);        //分配一定数目的空间用来存放huffcode到ret中
     int code = 0;
     int count = 0;
     for (int i = 0; i < 16; i++) {
-        for (int j = 0; j < a[i]; j++) {
+        for (int j = 0; j < a[i]; j++) {                //数组a中存放了从1bit到16bit中，码字的个数
             ret[count++] = make_pair(i + 1, code);
-            code += 1;
+            code += 1;               //第二条约束
         }
-        code = code << 1;
+        code = code << 1;                //第三条约束      
     }
     return ret;
 }
+
 void readDHT(FILE *f) {
     unsigned int len = EnterNewSection(f, "DHT");
     len -= 2;
     while (len > 0) {
-        unsigned char v[1];
-        fread(v, 1, 1, f);
-        unsigned char DCorAC = v[0] >> 4;
-        printf(DCorAC == 0 ? "DC\n" : "AC\n");
-        unsigned char id = v[0] & 0x0F;
-        printf("ID: %d\n", id);
+        unsigned char v;      //接下来的读取1个字节，高4位表示AC或者DC哈夫曼表。低4位表示哈夫曼表的ID，这里ID要么0要么1。
+        fread(&v, 1, 1, f);              //int 4个字节，char 是一个字节， char i = 1 -> 0000 0001
+        unsigned char DCorAC = v >> 4;       
+        printf(DCorAC == 0 ? "DC " : "AC ");
+        unsigned char id = v & 0x0F;
+        printf("%d\n", id);
 
         unsigned char a[16];
         fread(a, 1, 16, f);
@@ -365,16 +372,17 @@ void readDHT(FILE *f) {
             printf("%d ", a[i]);
             number += a[i];
         }
-        printf("\n");
-        auto huffCode = createHuffCode(a, number);
-        for (int i = 0; i < number; i++) {
+        printf("不同位宽下的数目\n");
+        auto huffCode = createHuffCode(a, number);             //huffcode 码表，其中形式就是pair数组，每个pair是一个<char, int>
+        for (int i = 0; i < number; i++) {                     //number指的是码表里面的个数，每次取一个元素放到码表里
             unsigned char v;
-            fread(&v, 1, 1, f);
+            fread(&v, 1, 1, f);                                //读取1个byte
             huffTable[DCorAC][id][huffCode[i]] = v;
-            printf("%d %d: %d\n", huffCode[i].first, huffCode[i].second, v);
+            //printf("%d %d: %d\n", huffCode[i].first, huffCode[i].second, v);           //这一步是将码表打印出来 -------- Code length  | Number | Symbol  Symbol是保存下一次取出Code 的位数
+            bitset<16> codeword(huffCode[i].second);
+            cout << "(" << std::dec << (int)huffCode[i].first << "," << codeword.to_string() << "): 0x" << hex << (int)v << endl;
         }
-        free(huffCode);
-
+        free(huffCode); 
         len -= (1 + 16 + number);
     }
 }
@@ -409,34 +417,37 @@ void removeBit(int key, int num){
     }
 }
 
-
-
 unsigned char matchHuff(unsigned char number, unsigned char ACorDC, int key) {
-    unsigned int len = 0;
+    char codeword[20] = "";
+    unsigned int codeword_val = 0;
     unsigned char codeLen;
     for (int count = 1; ; count++) {  
-        len = len << 1;
-        len += (unsigned int)getBit(key);    //每次读取一个bit
+        bool cur_bit = getBit(key);
+        codeword_val = codeword_val << 1;
+        codeword_val += (unsigned int)cur_bit;     //每次读取一个bit，每次左移，可以得到其中
+        codeword[count - 1] = '0' + (unsigned int)cur_bit;
         // 迭代器找到了该元素，没找到会返回end迭代器
-        if (huffTable[ACorDC][number].find(std::make_pair(count, len)) != huffTable[ACorDC][number].end()) { 
-            codeLen = huffTable[ACorDC][number][std::make_pair(count, len)];
+        if (huffTable[ACorDC][number].find(std::make_pair(count, codeword_val)) != huffTable[ACorDC][number].end()) { 
+            codeLen = huffTable[ACorDC][number][std::make_pair(count, codeword_val)];
             return codeLen;
         }
 
         if (ACorDC == DC) {
-            // DC codeword 最大为11个元素，如果失败了，抛弃11bit
-            if (count > 11) {
-                printf("%d, %d, %d\n", count, len, ACorDC);
+            // DC codeword 最大为11个元素，如果失败了，缺失key，重来。此时文件头已经读过去了,抛弃11bit
+            if (count > 6) { //该图像是6bit
+                codeword[11] = '\0';
+                printf("%d %s %d\n", count, codeword, ACorDC);
                 fprintf(stderr, "DC key not found\n"); 
-                count = 1; len = 0;
+                count = 1; codeword_val = 0; 
 
             }
         } else {
             // AC codeword 最大为16个元素，如果失败了，缺失key，重来。此时文件头已经读过去了，抛弃了16个bits
             if (count > 16) {
-                printf("%d, %d, %d\n", count, len, ACorDC);
+                codeword[15] = '\0';
+                printf("%d %s %d\n", count, codeword, ACorDC);
                 fprintf(stderr, "AC key not found\n"); 
-                count = 1; len = 0;
+                count = 1; codeword_val = 0;
             }
         }
     }
@@ -534,7 +545,7 @@ MCU readMCU(int key) {
 }
 
 void readData() {
-    printf("************************* Read data **********************************\n");
+    printf("Read data \n");
     int w = (image.width - 1) / (8*maxWidth) + 1;
     int h = (image.height - 1) / (8*maxHeight) + 1;
     int inter_mcu = w * h / stream_num; 
