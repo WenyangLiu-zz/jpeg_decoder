@@ -9,6 +9,7 @@
 #include <time.h>
 #include <string>
 #include <bitset>
+#include <iomanip> 
 
 using namespace std;
 
@@ -231,6 +232,32 @@ void showSectionName(const char *s) {
     return;
 }
 
+
+
+void outputMap() { //迭代器里数据除去了一些多余的0xFF
+    map<int, pair<int, string>>::iterator iter;
+    int i = 0;
+	for (iter = byteStream.begin(); iter != byteStream.end(); iter++) {
+        cout << "Start:" <<iter->first << endl;
+        cout << "Cur bit position:" << iter->second.first << endl;
+        for(unsigned char x : iter->second.second) {
+            if(i % 32 == 0) {
+                cout << endl;
+            }
+            cout << " 0x" << hex << setfill('0') << setw(2) << (int)x;
+            i++;
+        }  
+	}
+    iter = byteStream.begin();
+    int start = iter->first;
+    cout << endl << dec << iter->second.second.size() << " " << start ;
+    for (int i = 0;i< 2; i++) {
+        unsigned char x = iter->second.second[50000+i];
+        cout << " 0x" << hex << setfill('0') << setw(2) << (int)x;
+    }
+    cout << endl;
+}
+
 unsigned int readSectionLength(FILE *f) {
     unsigned char c;
     unsigned int length;
@@ -401,7 +428,7 @@ void readSOS(FILE *f) {
 }
 
 
-// 必須連續呼叫getBit，中間被fread斷掉就會出問題，每次读取一个bit
+// 必須連續呼叫getBit，中間被fread斷掉就會出問題，每次读取一个bit， byteStream[key].first 表示的当前的bit值
 bool getBit(int key) {
     // 虽然每次读取一个字节，但是利用了count的循环，控制了一个字节可以获取8个bit
     int cur_byte = byteStream[key].first / 8;
@@ -436,7 +463,7 @@ unsigned char matchHuff(unsigned char number, unsigned char ACorDC, int key) {
             // DC codeword 最大为11个元素，如果失败了，缺失key，重来。此时文件头已经读过去了,抛弃11bit
             if (count > 6) { //该图像是6bit
                 codeword[11] = '\0';
-                printf("%d %s %d\n", count, codeword, ACorDC);
+                printf("Byte position %d %d %d %s %d\n", key, byteStream[key].first / 8, byteStream[key].first % 8, codeword, ACorDC);
                 fprintf(stderr, "DC key not found\n"); 
                 count = 1; codeword_val = 0; 
 
@@ -445,7 +472,7 @@ unsigned char matchHuff(unsigned char number, unsigned char ACorDC, int key) {
             // AC codeword 最大为16个元素，如果失败了，缺失key，重来。此时文件头已经读过去了，抛弃了16个bits
             if (count > 16) {
                 codeword[15] = '\0';
-                printf("%d %s %d\n", count, codeword, ACorDC);
+                printf("Byte position %d %d %d %s %d\n", key, byteStream[key].first / 8, byteStream[key].first % 8, codeword, ACorDC);
                 fprintf(stderr, "AC key not found\n"); 
                 count = 1; codeword_val = 0;
             }
@@ -454,7 +481,6 @@ unsigned char matchHuff(unsigned char number, unsigned char ACorDC, int key) {
 }
 
 int readDC(unsigned char number, int key) {
-    // if (id == 1) {printf("%d ", ftell(f));}
     unsigned char codeLen = matchHuff(number, DC, key);  //查表,得到codelen，即下一次取多少bit
     if (codeLen == 0) { return 0; }  
     unsigned char first = getBit(key); //符号位
@@ -465,7 +491,6 @@ int readDC(unsigned char number, int key) {
         ret += first ? b : !b;
     }
     ret = first ? ret : -ret;
-    // printf("read DC: len %d, value %d\n", codeLen, ret);
     return ret;
 }
 
@@ -494,7 +519,6 @@ acCode readAC(unsigned char number, int key) {
         value += first ? b : !b;  // 如果first为真，就取b，否则！b         
     }
     value = first ? value : -value;
-    //printf("read AC: %d %d %d\n", codeLen, zeros, value);
     return acCode{codeLen, zeros, value};
 }
 
@@ -573,6 +597,7 @@ void readData() {
         }
     }
     BMP_WriteFile(bmp, "out.bmp");
+    outputMap();
 }
 
 
@@ -638,18 +663,6 @@ void matchRst(FILE *f){
     } 
     //readData(f);
     stream_num = byteStream.size();
-}
-
-
-
-void outputMap() {
-    map<int, pair<int, string>>::iterator iter;
-    int i = 0;
-	for (iter = byteStream.begin(); iter != byteStream.end(); iter++, i++) {
-        cout << "Start:" <<iter->first << endl;
-        cout << "Cur bit position:" << iter->second.first << endl;
-        cout << iter->second.second << endl;
-	}
 }
 
 void readStream(FILE *f) {
